@@ -1,0 +1,9 @@
+# R / RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Cache creati dallo script (snapshot Yahoo Finance e risultati rolling)
+data/
+output/
