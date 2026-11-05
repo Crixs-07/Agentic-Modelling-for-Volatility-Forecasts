@@ -3,7 +3,10 @@
 .RData
 .Ruserdata
 .Rproj.user/
+Rplots.pdf
 
-# Cache creati dallo script (snapshot Yahoo Finance e risultati rolling)
-data/
+# Risultati generati dallo script (cache rolling, tabelle, figure)
 output/
+
+# data/ è versionata: contiene dati di terzi (Yahoo Finance, VSTOXX),
+# quindi il repository deve restare privato.

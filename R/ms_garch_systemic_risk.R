@@ -31,12 +31,26 @@ library(readxl)
 START_DATE <- "2017-01-01"
 END_DATE   <- "2026-09-30"
 
-# Cartelle (relative al progetto RStudio) e file esterni
+# Cartelle relative alla radice del repository (lanciare da lì: Rscript R/ms_garch_systemic_risk.R)
 DIR_DATA    <- "data"
 DIR_OUT     <- "output"
-VSTOXX_FILE <- "/Users/cristianmarangione/Documents/From thesis to Paper/Fear Index Europe __ VSTOXX.xlsx"
-dir.create(DIR_DATA, showWarnings = FALSE)
-dir.create(DIR_OUT,  showWarnings = FALSE)
+DIR_FIG     <- file.path(DIR_OUT, "figures")
+DIR_TAB     <- file.path(DIR_OUT, "tables")
+VSTOXX_FILE <- file.path(DIR_DATA, "Fear Index Europe __ VSTOXX.xlsx")
+for (d in c(DIR_DATA, DIR_OUT, DIR_FIG, DIR_TAB)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+# Grafici e tabelle salvati su file, così i risultati sono leggibili anche da Rscript
+save_fig <- function(p, name, width = 10, height = 6) {
+  if (interactive()) print(p)
+  ggsave(file.path(DIR_FIG, paste0(name, ".png")), p, width = width, height = height, dpi = 120)
+  invisible(p)
+}
+save_tab <- function(x, name) {
+  x <- as.data.frame(x)
+  write.csv(x, file.path(DIR_TAB, paste0(name, ".csv")),
+            row.names = !identical(rownames(x), as.character(seq_len(nrow(x)))))
+  invisible(x)
+}
 
 # Gestione dei giorni di chiusura di singole borse (DECISIONE METODOLOGICA, Q1):
 #   "interp" = interpolazione lineare dei prezzi (scelta originale)
@@ -54,7 +68,7 @@ ROLL_SAMPLE <- "ticker"
 # I giorni senza scambi su alcun titolo (righe Yahoo spurie) sono sempre esclusi.
 #   0   = nessuna soglia aggiuntiva
 #   0.5 = escluse anche le date in cui quota meno della metà dei titoli
-MIN_QUOTED_SHARE <- 0
+MIN_QUOTED_SHARE <- 0.5
 
 # Scala dei rendimenti passati ai modelli GARCH/MS-GARCH.
 # 100 = percentuale (scala per cui MSGARCH è calibrato: bound, valori iniziali).
@@ -170,9 +184,11 @@ n_traded  <- rowSums(volume_df[-1] > 0 & !is.na(adjusted_df[-1]), na.rm = TRUE)
 n_listed  <- rowSums(!is.na(adjusted_df[-1]))
 keep_date <- n_traded > 0 & n_listed >= MIN_QUOTED_SHARE * length(tickers)
 
+dropped_dates <- data.frame(date = adjusted_df$date[!keep_date], n_quoted = n_listed[!keep_date],
+                            n_traded = n_traded[!keep_date])
 cat("\nDate escluse:\n")
-print(data.frame(date = adjusted_df$date[!keep_date], n_quoted = n_listed[!keep_date],
-                 n_traded = n_traded[!keep_date]), row.names = FALSE)
+print(dropped_dates, row.names = FALSE)
+save_tab(dropped_dates, "02_date_escluse")
 cat("\nOsservazioni residue con volume nullo (prezzo invariato, rendimento ~0):\n")
 print(colSums(volume_df[keep_date, -1] == 0 & !is.na(adjusted_df[keep_date, -1]), na.rm = TRUE))
 
@@ -194,7 +210,7 @@ labels_df <- adjusted_long %>%
   filter(date == max(date)) %>%
   ungroup()
 
-ggplot(adjusted_long, aes(x = date, y = Adjusted, color = Ticker)) +
+p_prices <- ggplot(adjusted_long, aes(x = date, y = Adjusted, color = Ticker)) +
   geom_line(na.rm = TRUE) +
   geom_text_repel(
     data = labels_df, aes(label = Ticker),
@@ -207,6 +223,7 @@ ggplot(adjusted_long, aes(x = date, y = Adjusted, color = Ticker)) +
   theme_minimal() +
   theme(legend.position = "none") +
   xlim(min(adjusted_long$date), max(adjusted_long$date) + 200)
+save_fig(p_prices, "03_prezzi", width = 12, height = 7)
 
 #-------------------------------------------------------------------------------
 # Fase 4: Valori mancanti e calendari di borsa
@@ -264,13 +281,14 @@ cat("\nCampione comune:", format(range(log_returns_df$date)), "| T =", nrow(log_
 
 log_returns_long <- pivot_longer(log_returns_df, -date, names_to = "Ticker", values_to = "LogReturn")
 
-ggplot(log_returns_long, aes(x = date, y = LogReturn)) +
+p_returns <- ggplot(log_returns_long, aes(x = date, y = LogReturn)) +
   geom_line(color = "steelblue", alpha = 0.8) +
   facet_grid(Ticker ~ ., scales = "free_y") +
   labs(title = paste0("Rendimenti Logaritmici delle Banche Europee (", year_range, ")"),
        subtitle = "Evidente il 'volatility clustering' e i picchi di volatilità concomitanti",
        x = "Data", y = "Rendimento Logaritmico") +
   theme_minimal()
+save_fig(p_returns, "05_rendimenti", width = 10, height = 24)
 
 #-------------------------------------------------------------------------------
 # Fase 6: Statistiche descrittive e test preliminari
@@ -292,6 +310,19 @@ get_desc_stats <- function(x) {
 tabella_descrittive <- as.data.frame(t(sapply(log_returns_df[-1], get_desc_stats)))
 print("Tabella 1: Statistiche Descrittive e Test Diagnostici sui Rendimenti")
 print(round(tabella_descrittive, 4))
+save_tab(tabella_descrittive, "06_descrittive")
+
+# Qualità dei dati: rendimenti nulli (prezzi stantii) e autocorrelazione al primo
+# ritardo di rendimenti e rendimenti al quadrato (AC1_r2 < 0 è anomala per un titolo
+# bancario e compatibile con il regime alternato stimato per BPE.MI)
+data_quality <- data.frame(
+  Zero_ret = sapply(log_returns_df[-1], function(x) mean(x == 0)),
+  AC1_r    = sapply(log_returns_df[-1], function(x) acf(x,   lag.max = 1, plot = FALSE)$acf[2]),
+  AC1_r2   = sapply(log_returns_df[-1], function(x) acf(x^2, lag.max = 1, plot = FALSE)$acf[2])
+)
+print("Tabella 1b: Qualità dei dati")
+print(round(data_quality[order(data_quality$AC1_r2), ], 4))
+save_tab(data_quality, "06_qualita_dati")
 
 # Asimmetria negativa e curtosi molto elevata: innovazioni t di Student.
 
@@ -308,6 +339,7 @@ get_stationarity_tests <- function(x) {
 tabella_stazionarieta <- t(sapply(log_returns_df[-1], get_stationarity_tests))
 print("Tabella 2: Test di Stazionarietà sui Rendimenti")
 print(round(tabella_stazionarieta, 4))
+save_tab(tabella_stazionarieta, "06_stazionarieta")
 
 # Volatilità realizzata: deviazione standard mobile a 20 giorni, annualizzata
 daily_ret_xts <- xts(select(log_returns_df, -date), order.by = log_returns_df$date)
@@ -330,7 +362,7 @@ realized_vol_plots <- imap(unname(ticker_groups), function(grp, i) {
     theme_minimal() +
     theme(plot.title = element_text(hjust = 0.5))
 })
-walk(realized_vol_plots, print)
+iwalk(realized_vol_plots, function(p, i) save_fig(p, sprintf("06_vol_realizzata_gruppo%d", i), height = 12))
 
 #-------------------------------------------------------------------------------
 # Funzioni comuni ai modelli
@@ -529,6 +561,7 @@ for (ticker in tickers) {
 diagnostics_df <- bind_rows(diagnostics_list, .id = "ticker")
 print("Tabella 3: Diagnostica dei modelli GARCH a regime singolo")
 print(diagnostics_df, digits = 4)
+save_tab(diagnostics_df, "07_garch_benchmark")
 
 # INTERPRETAZIONE:
 # - AIC/BIC (totali, scala decimale): confrontabili tra modelli stimati sulla stessa serie.
@@ -637,6 +670,7 @@ for (ticker in tickers) {
 ms_summary_df <- bind_rows(ms_summary_list)
 print("Tabella 4: MS-GARCH sul campione completo")
 print(ms_summary_df, digits = 4)
+save_tab(ms_summary_df, "08_msgarch_campione_completo")
 
 # Guadagno di log-verosimiglianza delle partenze multiple rispetto al default
 if (length(multistart_list)) {
@@ -653,6 +687,8 @@ if (length(multistart_list)) {
     arrange(desc(Gain))
   print("Tabella 4b: partenze multiple (Gain > 0 = il default non era l'ottimo)")
   print(ms_gain, n = Inf)
+  save_tab(multistart_df, "08_partenze_multiple_dettaglio")
+  save_tab(ms_gain, "08_partenze_multiple")
 }
 
 # Confronto dei criteri informativi (stessa serie, stessa scala, totali)
@@ -663,6 +699,7 @@ ic_comparison <- ms_summary_df %>%
   rename(sGARCH_AIC = AIC, sGARCH_BIC = BIC)
 print("Tabella 5: Criteri informativi a confronto (valori più bassi = fit migliore)")
 print(ic_comparison, digits = 6)
+save_tab(ic_comparison, "08_criteri_informativi")
 
 # COME INTERPRETARE I RISULTATI MS-GARCH:
 # - P11, P22: probabilità di permanenza; durata attesa = 1 / (1 - Pii).
@@ -816,6 +853,7 @@ if (RUN_SCALE_CHECK) {
   })
   print(scale_check, digits = 4)
   print(summary(scale_check$dLL))
+  save_tab(scale_check, "09_controllo_scala")
 }
 
 #-------------------------------------------------------------------------------
@@ -872,6 +910,7 @@ transitions_summary <- all_windows %>%
     Pi_Low      = 1 - Pi_High
   )
 print(transitions_summary, n = Inf)
+save_tab(transitions_summary, "10_transizioni_rolling")
 
 # Controlli del rolling
 roll_checks <- all_windows %>%
@@ -885,17 +924,19 @@ roll_checks <- all_windows %>%
     .groups = "drop"
   )
 print(roll_checks, n = Inf)
+save_tab(roll_checks, "10_controlli_rolling")
 stopifnot(
   all(all_windows$UncondVol_State2[all_windows$Fit_OK] >= all_windows$UncondVol_State1[all_windows$Fit_OK]),
   isTRUE(all.equal(all_forecasts_raw$Prob_State1 + all_forecasts_raw$Prob_State2,
                    rep(1, nrow(all_forecasts_raw))))
 )
 
-ggplot(daily_high_prob, aes(Date, Prob_High)) +
+p_roll <- ggplot(daily_high_prob, aes(Date, Prob_High)) +
   geom_line() +
   facet_wrap(~ Ticker, scales = "free_x") +
   labs(title = "Daily Probability of High Volatility state", x = NULL, y = "Prob(High)") +
   theme_minimal()
+save_fig(p_roll, "10_prob_high_rolling", width = 14, height = 10)
 
 # Oggetti utili in ambiente:
 # - all_windows: parametri per finestra (P, LL/AIC/BIC, vol incondizionate, par_*, convergenza)
@@ -918,23 +959,26 @@ rolling_wide <- daily_high_prob %>%
 cor_mat <- cor(select(rolling_wide, -Date), use = "pairwise.complete.obs", method = "spearman")
 cat("\nCorrelation matrix of HIGH-state probabilities across banks:\n")
 print(round(cor_mat, 2))
+save_tab(cor_mat, "11_correlazioni_prob_high")
 
 cor_long <- as.data.frame(as.table(cor_mat), responseName = "rho") %>%
   rename(Bank1 = Var1, Bank2 = Var2)
 
-ggplot(cor_long, aes(x = Bank1, y = Bank2, fill = rho)) +
+p_cor <- ggplot(cor_long, aes(x = Bank1, y = Bank2, fill = rho)) +
   geom_tile() +
   scale_fill_gradient2(limits = c(-1, 1), midpoint = 0, name = "Spearman ρ") +
   coord_fixed() +
   labs(title = "Correlation matrix of HIGH-state probabilities across banks", x = NULL, y = NULL) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+save_fig(p_cor, "11_correlazioni_prob_high", width = 9, height = 8)
 
 cor_mean_by_ticker <- data.frame(Ticker = colnames(cor_mat),
                                  MeanCorr = rowMeans(cor_mat, na.rm = TRUE)) %>%
   arrange(desc(MeanCorr))
 cat("\nMean cross-bank correlation of Prob(High) by ticker:\n")
 print(cor_mean_by_ticker)
+save_tab(cor_mean_by_ticker, "11_correlazione_media")
 
 # 2) Cluster index: numero di banche sopra soglia --------------------------------
 threshold <- 0.5
@@ -952,7 +996,7 @@ p_idx <- ggplot(cluster_index, aes(x = Date, y = Count_High)) +
        subtitle = paste0("Threshold: Prob(High) > ", threshold, " | Dashed Lines = crisis dates"),
        x = "Date", y = "Count of Banks") +
   theme_minimal()
-print(p_idx)
+save_fig(p_idx, "11_cluster_index")
 
 # 3) Heatmap Prob(High) ---------------------------------------------------------
 p_hm <- ggplot(mutate(daily_high_prob, Ticker = factor(Ticker, levels = sort(unique(Ticker)))),
@@ -964,7 +1008,7 @@ p_hm <- ggplot(mutate(daily_high_prob, Ticker = factor(Ticker, levels = sort(uni
        subtitle = "Colore più intenso = alta probabilità di regime di crisi",
        x = "Date", y = "Banca", fill = "Prob(High)") +
   theme_minimal()
-print(p_hm)
+save_fig(p_hm, "11_heatmap_prob_high", width = 14, height = 8)
 
 # 4) Indici di settore: equal-weighted e market-cap-weighted ---------------------
 # Il cap-weighted è rinormalizzato sui titoli disponibili in ciascuna data,
@@ -984,11 +1028,16 @@ p_eq <- ggplot(daily_avg_prob, aes(Date, Mean_Prob_High)) +
   geom_line() +
   labs(title = "Prob(High) di settore (equal-weighted mean)", x = NULL, y = "Mean Prob(High)") +
   theme_minimal()
-print(p_eq)
+save_fig(p_eq, "11_indice_equal_weight")
+save_tab(daily_avg_prob, "11_indici_settore")
 
 #===============================================================================
 # Fase 12: Confronto indici di settore con VSTOXX
 #===============================================================================
+
+if (!file.exists(VSTOXX_FILE)) {
+  warning("File VSTOXX non trovato (", VSTOXX_FILE, "): Fase 12 saltata")
+} else {
 
 VSTOXX <- read_excel(VSTOXX_FILE) %>%
   mutate(Date = as.Date(Date))
@@ -1017,4 +1066,9 @@ p_sys <- ggplot(mutate(df, Index_on_prob_scale = to_prob_scale(Indexvalue)), aes
   labs(title = "Systemic Prob(High): equal vs cap-weighted, and VSTOXX", x = NULL, color = NULL) +
   theme_minimal() +
   theme(legend.position = "top")
-print(p_sys)
+save_fig(p_sys, "12_indici_vs_vstoxx", width = 12, height = 6)
+
+}
+
+# Versioni di R e dei pacchetti usate per questo run
+writeLines(capture.output(sessionInfo()), file.path(DIR_OUT, "sessionInfo.txt"))
