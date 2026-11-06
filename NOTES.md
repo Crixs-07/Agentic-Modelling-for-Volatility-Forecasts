@@ -103,6 +103,13 @@ Parameters live in Phase 0 of the script.
 9. Bounds: ν in [2.1, 100]; GJR lower (1e-7, 1e-6, 1e-4, 0), upper
    (100, 0.9999, 10, 0.9999); the stationarity constraint is
    α1 + 0.5·α2 + β < 0.99999999.
+10. **Main cause of failed fits**: when P approaches the identity matrix,
+    `loadparam` (`src/MSgarch.h`) cannot invert the matrix it uses for the
+    ergodic distribution ("matrix multiplication: problem with matrix
+    inverse"). The error escapes `f_nll`, aborts `optim` and the window is
+    lost. Proposal P8 in `R/revision_tests.R` treats the point as
+    inadmissible (penalty 1e10). Fits that never hit the error are unchanged.
+    On synthetic data this removed every failure (4 → 0).
 
 ## Empirical findings so far
 
@@ -134,6 +141,47 @@ the next run.
   ACA (p < 0.01) and for BNP and GLE (p < 0.05), plus remaining ARCH effects
   for INGA and ABN. KPSS rejects stationarity at 5% for BBVA, SAB, SAN, UCG,
   ABN and BPE, while ADF and PP reject a unit root for every series.
+
+## Paper revision (November 2026): answers from the code
+
+`R/revision_tests.R` implements the proposals below without touching the main
+script (outputs in `output/revision/`). Tested on synthetic data only so far.
+
+- **Cap-weighted weights**: fixed for the whole sample. The vector `m_caps`
+  (USD bn, "June 2025") comes from the original script. The code does not say
+  where the figures were taken from: the source must be documented.
+- **Rolling probabilities**: the main script estimates once per window and
+  then propagates the filtered probability of the window's last day,
+  p_T Pʰ for h = 1..10, *without* using the returns of those 10 days. The
+  daily-looking series is therefore an h-step-ahead prediction that decays
+  towards the ergodic probability and jumps at each re-estimation.
+  Proposal P2: filter the 10 following days with fixed parameters,
+  Pr(s_t | I_t), which still involves no look-ahead.
+- **High regime when φ ≈ 1**: MSGARCH cannot return φ = α1 + 0.5·α2 + β = 1
+  (constraint φ < 0.99999999), so a reported "1" is a rounded value.
+  The rule α0 / (1 − φ) then labels the near-integrated regime "high"
+  almost automatically, whatever its volatility level in the window.
+  Proposal P3: rank regimes by their conditional volatility averaged with the
+  smoothed probabilities. The test script records how often the two rules disagree.
+- **Interpolation**: every internal gap is interpolated, whatever its cause.
+  Gaps are at most 2 consecutive days, but not all are holidays (e.g.
+  2018-09-20, no price for any of the 5 Spanish banks). The test script
+  classifies every gap.
+- **IQR outliers**: there is no IQR rule anywhere in the code. The test
+  script produces a list (k = 3, flag only) to check by hand before the paper
+  can say they were "checked and kept".
+- **BIC**: the main script already compares sGARCH(1,1)-t (rugarch), GJR-t
+  K = 1 and MS-GJR (Table 5). Numbers from the original script are not
+  comparable (per-observation vs total IC, one-observation offset), so
+  Table B.1 must be recomputed.
+- **756-day window**: never run in this pipeline; `RUN_756` in the test script.
+- **MSGARCH `State()` indices**: `FiltProb[t]` = Pr(s_t | I_t), with row 1 =
+  ergodic distribution. `PredProb` has T + 1 rows: `PredProb[t]` =
+  Pr(s_t | I_{t−1}) for t ≥ 2, and the out-of-sample one-step forecast is
+  `PredProb[T + 1]`, not `PredProb[T]`. `SmoothProb` has T + 1 rows.
+  `UncVol()` is not per regime (see point 1 of the MSGARCH section).
+- **VSTOXX**: the official STOXX file `h_v2tx.txt` (daily, from 1999,
+  semicolon-separated `Date;Symbol;Indexvalue`) is downloaded by the test script.
 
 ## Open issues and next steps
 
