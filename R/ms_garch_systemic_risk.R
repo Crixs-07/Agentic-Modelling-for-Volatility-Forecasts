@@ -133,7 +133,10 @@ w_mcap  <- m_caps / sum(m_caps)
 crisis_dates <- as.Date(c(
   "2020-03-18",  # PEPP / crisi COVID
   "2022-02-24",  # invasione Ucraina
-  "2025-02-04"   # nuovi dazi USA su import cinesi
+  "2023-03-10",  # fallimento di SVB
+  "2023-03-15",  # crollo di Credit Suisse
+  "2025-02-04",  # nuovi dazi USA su import cinesi
+  "2025-04-02"   # dazi USA del "Liberation Day"
 ))
 # https://www.ecb.europa.eu/press/pr/date/2020/html/ecb.pr200318_1~3949d6f266.en.html
 # https://www.ecb.europa.eu/press/economic-bulletin/focus/2022/html/ecb.ebbox202205_07~6db6f2c297.en.html

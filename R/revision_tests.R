@@ -16,6 +16,10 @@
 #   P6  BIC di sGARCH(1,1), GJR(1,1) a un regime e MS-GJR sullo stesso campione
 #   P7  robustezza con finestra di 756 giorni (RUN_756)
 #   P8  un errore numerico di MSGARCH durante l'ottimizzazione non fa più perdere la stima
+#   P9  divario SPI - Prob(High) del portafoglio, giorni di disaccordo, medie annuali
+#       (spunti di benchmark_prelim, reimplementati qui)
+#   P10 rolling con la sola partenza di default, senza warm start (RUN_COLD), per
+#       misurare quanto il warm start cambia le Prob(High) (spunto di benchmark_prelim)
 #
 # Smoke test su dati sintetici (solo per verificare il codice, non per i risultati):
 #   REV_SMOKE=1 REV_PRICES=<file.rds> Rscript R/revision_tests.R
@@ -65,12 +69,17 @@ XCORR_LAGS        <- c(-20, -10, -5, 0, 5, 10, 20)   # corr(x_t, y_{t+k}), giorn
 ARCH_LAGS         <- c(5, 10)
 IQR_K             <- 3                         # outlier: fuori da [Q1 - k IQR, Q3 + k IQR]
 RUN_756           <- FALSE                     # P7: rolling con finestra di 756 giorni (lento)
+RUN_COLD          <- TRUE                      # P10: confronto con la sola partenza di default
+N_COLD_CHECK      <- 3                         # P10: finestre "default" ristimate per titolo come controllo
 FIG_DPI           <- 300
 
-# Eventi (il quarto è un'ipotesi da confermare)
+# Eventi (decisi dall'autore il 9/11/2026: tutti quelli citati nel paper, nel file
+# di prova e in benchmark_prelim). Le finestre di SVB e Credit Suisse si sovrappongono.
 events <- data.frame(
-  event = c("COVID / PEPP", "Invasione dell'Ucraina", "DA CONFERMARE: SVB / Credit Suisse", "Dazi USA"),
-  date  = as.Date(c("2020-03-18", "2022-02-24", "2023-03-10", "2025-02-04"))
+  event = c("COVID / PEPP", "Invasione dell'Ucraina", "SVB", "Credit Suisse",
+            "Dazi USA", "Dazi USA (Liberation Day)"),
+  date  = as.Date(c("2020-03-18", "2022-02-24", "2023-03-10", "2023-03-15",
+                    "2025-02-04", "2025-04-02"))
 )
 
 SMOKE <- nzchar(Sys.getenv("REV_SMOKE"))
@@ -293,30 +302,42 @@ rolling_ms_series <- function(r, dates, label, window = WIN, step = STEP, horizo
     }
     prev_par <- fit$par
 
-    hs_unc <- which.max(regime_uncond_vol(fit))
-    cv     <- high_state_condvol(fit)
-    hs_cv  <- if (is.na(cv$hs)) hs_unc else cv$hs
-
-    # FiltProb[t] = Pr(s_t | I_t); la riga window coincide con quella della stima sulla finestra
-    st_ext <- State(object = spec, par = fit$par, data = y[s:max(tgt)])
-    filt   <- matrix(st_ext$FiltProb[window + seq_len(horizon), 1, ], ncol = 2)
-    pred   <- multi_step_state_probs(st_ext$FiltProb[window, 1, ], TransMat(fit), horizon)
+    wp <- window_probs(fit, y, s, e, tgt, spec)
 
     windows_list[[i]] <- cbind(info, data.frame(
       Fit_OK = TRUE, Start_used = start_used, Convergence = fit$convergence,
-      HS_uncvol = hs_unc, HS_condvol = hs_cv,
+      HS_uncvol = wp$hs_unc, HS_condvol = wp$hs_cv,
       Phi_R1 = persistence(fit, 1), Phi_R2 = persistence(fit, 2),
       UncVol_R1 = regime_uncond_vol(fit)[1] / scale, UncVol_R2 = regime_uncond_vol(fit)[2] / scale,
-      CondVol_R1 = cv$vol[1] / scale, CondVol_R2 = cv$vol[2] / scale,
+      CondVol_R1 = wp$cv$vol[1] / scale, CondVol_R2 = wp$cv$vol[2] / scale,
       P11 = TransMat(fit)[1, 1], P22 = TransMat(fit)[2, 2]
     ))
-    forecasts_list[[i]] <- data.frame(
-      Series = label, Window_ID = i, Horizon_h = seq_len(horizon), Date = dates[tgt],
-      Filt_S1 = filt[, 1], Filt_S2 = filt[, 2], Pred_S1 = pred[, 1], Pred_S2 = pred[, 2],
-      HS_uncvol = hs_unc, HS_condvol = hs_cv
-    )
+    forecasts_list[[i]] <- window_forecasts(wp, label, i, dates[tgt])
   }
   list(windows = bind_rows(windows_list), forecasts = bind_rows(forecasts_list))
+}
+
+# Stato alto (entrambe le regole) e probabilità dei giorni tgt per la stima su y[s:e].
+# Usata dal rolling e dal confronto con la partenza singola (P10).
+window_probs <- function(fit, y, s, e, tgt, spec = ms_spec) {
+  window  <- e - s + 1
+  horizon <- length(tgt)
+  hs_unc  <- which.max(regime_uncond_vol(fit))
+  cv      <- high_state_condvol(fit)
+  hs_cv   <- if (is.na(cv$hs)) hs_unc else cv$hs
+
+  # FiltProb[t] = Pr(s_t | I_t); la riga window coincide con quella della stima sulla finestra
+  st_ext <- State(object = spec, par = fit$par, data = y[s:max(tgt)])
+  list(hs_unc = hs_unc, hs_cv = hs_cv, cv = cv,
+       filt = matrix(st_ext$FiltProb[window + seq_len(horizon), 1, ], ncol = 2),
+       pred = multi_step_state_probs(st_ext$FiltProb[window, 1, ], TransMat(fit), horizon))
+}
+window_forecasts <- function(wp, label, i, tgt_dates) {
+  data.frame(
+    Series = label, Window_ID = i, Horizon_h = seq_along(tgt_dates), Date = tgt_dates,
+    Filt_S1 = wp$filt[, 1], Filt_S2 = wp$filt[, 2], Pred_S1 = wp$pred[, 1], Pred_S2 = wp$pred[, 2],
+    HS_uncvol = wp$hs_unc, HS_condvol = wp$hs_cv
+  )
 }
 
 # Portafoglio equal-weighted ribilanciato ogni giorno (P4)
@@ -556,6 +577,162 @@ if (RUN_756) {
   )
   print("Robustezza 504 vs 756 giorni"); print(robustness)
   save_tab(robustness, "robustezza_finestra_756")
+}
+
+#-------------------------------------------------------------------------------
+# Fase 8: Spunti da benchmark_prelim, reimplementati sulla nostra pipeline (P9, P10)
+#-------------------------------------------------------------------------------
+
+# P9a: divario tra SPI e Prob(High) del portafoglio equal-weighted. Lo SPI conta
+# quante banche sono nello stato alto; il portafoglio diversificato registra solo
+# lo stress comune, quindi i giorni di disaccordo separano stress diffuso e idiosincratico.
+gap_tab <- map_dfr(c("SPI_EW", "SPI_cap"), function(m) {
+  d       <- bench[!is.na(bench[[m]]) & !is.na(bench$Port_Prob), ]
+  gap     <- d[[m]] - d$Port_Prob
+  hi_spi  <- d[[m]] > 0.5
+  hi_port <- d$Port_Prob > 0.5
+  data.frame(Measure = m, N_days = nrow(d),
+             Gap_mean = mean(gap), Gap_sd = sd(gap), Gap_min = min(gap), Gap_max = max(gap),
+             Share_both_high         = mean(hi_spi & hi_port),
+             Share_SPI_high_port_low = mean(hi_spi & !hi_port),
+             Share_port_high_SPI_low = mean(!hi_spi & hi_port),
+             Share_both_low          = mean(!hi_spi & !hi_port))
+})
+print("P9: divario SPI - Prob(High) del portafoglio (soglia 0.5)"); print(gap_tab, digits = 3)
+save_tab(gap_tab, "p9_divario_spi_portafoglio")
+
+# P9b: medie annuali (il primo e l'ultimo anno sono parziali: vedi First, Last, N_days)
+yearly_tab <- bench %>%
+  left_join(cluster, by = "Date") %>%
+  mutate(Year = as.integer(format(Date, "%Y"))) %>%
+  group_by(Year) %>%
+  summarise(N_days = n(), First = min(Date), Last = max(Date),
+            across(c(SPI_EW, SPI_cap, Port_Prob, Count_High, RV22, VSTOXX), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop")
+print("P9: medie annuali"); print(as.data.frame(yearly_tab), digits = 3)
+save_tab(yearly_tab, "p9_medie_annuali")
+
+# P10: stesso rolling con la sola partenza di default (nessun warm start). Dove il
+# rolling ha già scelto la partenza di default la stima è la stessa e si riusa la
+# cache; si ristimano le finestre in cui ha vinto il warm start o la stima è fallita,
+# più N_COLD_CHECK finestre "default" per titolo per controllare che la ristima
+# riproduca la cache.
+cold_rolling <- function(nm, res, window = WIN, step = STEP, horizon = HORIZ,
+                         scale = RET_SCALE, spec = ms_spec) {
+  y      <- scale * series_list[[nm]]$r
+  dates  <- series_list[[nm]]$dates
+  starts <- seq.int(1, length(y) - window - horizon + 1, by = step)
+  win    <- res[[nm]]$windows
+  fc     <- res[[nm]]$forecasts
+  stopifnot(nrow(win) == length(starts), identical(win$Window_ID, seq_along(starts)))
+
+  is_default <- win$Fit_OK & win$Start_used %in% "default"
+  def_ids    <- which(is_default)
+  check_ids  <- def_ids[unique(round(seq(1, length(def_ids), length.out = min(N_COLD_CHECK, length(def_ids)))))]
+  refit_ids  <- which(!is_default)
+
+  refit <- function(i) {
+    s   <- starts[i]
+    e   <- s + window - 1
+    tgt <- (e + 1):(e + horizon)
+    fit <- fit_ms(spec, y[s:e], do.se = FALSE)
+    if (is.null(fit)) return(NULL)
+    window_forecasts(window_probs(fit, y, s, e, tgt, spec), nm, i, dates[tgt])
+  }
+  new <- setNames(lapply(refit_ids, refit), refit_ids)
+
+  prob_cols <- c("Filt_S1", "Filt_S2", "Pred_S1", "Pred_S2")
+  check <- map_dfr(check_ids, function(i) {
+    a <- filter(fc, Window_ID == i)
+    b <- refit(i)
+    data.frame(Series = nm, Window_ID = i,
+               Max_abs_diff = if (is.null(b)) NA_real_ else max(abs(as.matrix(a[prob_cols]) - as.matrix(b[prob_cols]))),
+               Same_high_state = !is.null(b) && all(a$HS_uncvol == b$HS_uncvol & a$HS_condvol == b$HS_condvol))
+  })
+
+  list(forecasts = bind_rows(filter(fc, Window_ID %in% def_ids), bind_rows(new)) %>% arrange(Window_ID, Horizon_h),
+       check     = check,
+       summary   = data.frame(Series = nm, N_windows = length(starts), N_warm_chosen = sum(win$Start_used %in% "warm"),
+                              N_refit = length(refit_ids), N_cold_failed = sum(vapply(new, is.null, logical(1)))))
+}
+
+if (RUN_COLD) {
+  cold_cache <- file.path(DIR_REV, sprintf("rolling_rev_cold_%s_%s_q%02d_w%d_s%d_h%d.rds", format(SAMPLE_END),
+                                           HOLIDAY_METHOD, round(100 * MIN_QUOTED_SHARE), WIN, STEP, HORIZ))
+  if (file.exists(cold_cache)) {
+    res_cold <- readRDS(cold_cache)
+  } else {
+    t0 <- Sys.time()
+    res_cold <- parallel::mclapply(names(res_504), function(nm) {
+      tryCatch(cold_rolling(nm, res_504),
+               error = function(e) { message("  -> partenza singola ", nm, ": ", conditionMessage(e)); NULL })
+    }, mc.cores = N_CORES)
+    names(res_cold) <- names(res_504)
+    res_cold <- keep(res_cold, is.list)
+    saveRDS(res_cold, cold_cache)
+    cat("Rolling a partenza singola completato in",
+        round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), "minuti\n")
+  }
+
+  cold_check <- bind_rows(map(res_cold, "check"))
+  print("P10: controllo di riproducibilità (finestre 'default' ristimate)"); print(cold_check, digits = 3)
+  save_tab(cold_check, "p10_controllo_riproducibilita")
+
+  prob_cold <- daily_prob(res_cold)
+  cmp <- inner_join(select(prob_504, Series, Date, Prob_warm = Prob_High),
+                    select(prob_cold, Series, Date, Prob_cold = Prob_High), by = c("Series", "Date"))
+  cold_tab <- cmp %>%
+    group_by(Series) %>%
+    summarise(N_days               = n(),
+              Pearson              = cor(Prob_warm, Prob_cold),
+              Mean_abs_diff        = mean(abs(Prob_warm - Prob_cold)),
+              Max_abs_diff         = max(abs(Prob_warm - Prob_cold)),
+              Share_diff_gt_0.5    = mean(abs(Prob_warm - Prob_cold) > 0.5),
+              Share_class_differs  = mean((Prob_warm > 0.5) != (Prob_cold > 0.5)),
+              .groups = "drop") %>%
+    left_join(bind_rows(map(res_cold, "summary")), by = "Series")
+  print("P10: warm start contro partenza singola, per serie"); print(as.data.frame(cold_tab), digits = 3)
+  save_tab(cold_tab, "p10_partenza_singola_serie")
+
+  spi_cold <- prob_cold %>%
+    filter(Series != "PORTFOLIO_EW") %>%
+    left_join(data.frame(Series = names(w_mcap), w = unname(w_mcap)), by = "Series") %>%
+    group_by(Date) %>%
+    summarise(SPI_EW_cold  = mean(Prob_High),
+              SPI_cap_cold = sum(Prob_High * w) / sum(w),
+              N_banks_cold = n(), .groups = "drop")
+  bench_cold <- bench %>%
+    left_join(spi_cold, by = "Date") %>%
+    left_join(prob_cold %>% filter(Series == "PORTFOLIO_EW") %>% select(Date, Port_Prob_cold = Prob_High),
+              by = "Date")
+  pairs <- c(SPI_EW = "SPI_EW_cold", SPI_cap = "SPI_cap_cold", Port_Prob = "Port_Prob_cold")
+  cold_agg <- map_dfr(names(pairs), function(m) {
+    mc <- pairs[[m]]
+    data.frame(Measure = m,
+               Pearson_warm_cold   = cor(bench_cold[[m]], bench_cold[[mc]], use = "complete.obs"),
+               Mean_abs_diff       = mean(abs(bench_cold[[m]] - bench_cold[[mc]]), na.rm = TRUE),
+               Max_abs_diff        = max(abs(bench_cold[[m]] - bench_cold[[mc]]), na.rm = TRUE),
+               Pearson_RV22_warm   = cor(bench_cold[[m]],  bench_cold$RV22,   use = "complete.obs"),
+               Pearson_RV22_cold   = cor(bench_cold[[mc]], bench_cold$RV22,   use = "complete.obs"),
+               Pearson_VSTOXX_warm = cor(bench_cold[[m]],  bench_cold$VSTOXX, use = "complete.obs"),
+               Pearson_VSTOXX_cold = cor(bench_cold[[mc]], bench_cold$VSTOXX, use = "complete.obs"))
+  })
+  print("P10: warm start contro partenza singola, indici"); print(cold_agg, digits = 3)
+  save_tab(cold_agg, "p10_partenza_singola_indici")
+  save_tab(bench_cold, "p10_serie_partenza_singola")
+
+  fig6 <- bench_cold %>%
+    select(Date, SPI_EW, SPI_EW_cold, Port_Prob, Port_Prob_cold) %>%
+    pivot_longer(-Date) %>%
+    mutate(Panel = ifelse(grepl("^SPI", name), "SPI equal-weight", "Prob(High) portafoglio"),
+           Start = ifelse(grepl("_cold$", name), "Partenza singola", "Warm start")) %>%
+    ggplot(aes(Date, value, colour = Start)) +
+    geom_line(linewidth = 0.35, na.rm = TRUE) + ev_lines +
+    facet_wrap(~ Panel, ncol = 1) +
+    scale_colour_manual(values = c("Warm start" = "#7B5EA7", "Partenza singola" = "darkorange")) +
+    labs(x = NULL, y = NULL, colour = NULL) +
+    theme_minimal() + theme(legend.position = "top")
+  save_fig_hd(fig6, "fig_p10_warm_vs_partenza_singola", width = 10, height = 6)
 }
 
 writeLines(capture.output(sessionInfo()), file.path(DIR_REV, "sessionInfo.txt"))
